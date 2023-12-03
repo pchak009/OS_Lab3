@@ -13,7 +13,9 @@ struct proc proc[NPROC];
 struct proc *initproc;
 
 int nextpid = 1;
+int next_thread_id = 1;
 struct spinlock pid_lock;
+struct spinlock thread_id_lock;
 
 extern void forkret(void);
 static void freeproc(struct proc *p);
@@ -51,6 +53,7 @@ procinit(void)
   
   initlock(&pid_lock, "nextpid");
   initlock(&wait_lock, "wait_lock");
+  initlock(&thread_id_lock,"next_thread_id");
   for(p = proc; p < &proc[NPROC]; p++) {
       initlock(&p->lock, "proc");
       p->state = UNUSED;
@@ -102,10 +105,31 @@ allocpid()
   return pid;
 }
 
+int
+alloc_thread_id()
+{
+  int thread_id;
+
+  acquire(&thread_id_lock);
+  thread_id = next_thread_id;
+  next_thread_id = next_thread_id + 1;
+  release(&thread_id_lock);
+
+  return thread_id;
+}
 // Look in the process table for an UNUSED proc.
 // If found, initialize state required to run in the kernel,
 // and return with p->lock held.
 // If there are no free procs, or a memory allocation fails, return 0.
+int tid_allock()
+{
+  acquire(&thread_id_lock);
+  int thread_id = next_thread_id;
+  next_thread_id = next_thread_id + 1;
+  release(&thread_id_lock);
+
+  return thread_id;
+}
 static struct proc*
 allocproc(void)
 {
@@ -158,8 +182,16 @@ freeproc(struct proc *p)
   if(p->trapframe)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
-  if(p->pagetable)
-    proc_freepagetable(p->pagetable, p->sz);
+
+  // Check if the process has a valid page table
+  if(p->pagetable) {
+    // If it's the main thread (thread_id == 0), free the entire page table 
+    if(p->thread_id == 0)
+      proc_freepagetable(p->pagetable, p->sz);
+    else
+      // If it's a thread, unmap its user stack space in the page table
+      uvmunmap(p->pagetable, TRAPFRAME - PGSIZE*p->thread_id, 1, 0);
+  }
   p->pagetable = 0;
   p->sz = 0;
   p->pid = 0;
@@ -311,7 +343,7 @@ fork(void)
   safestrcpy(np->name, p->name, sizeof(p->name));
 
   pid = np->pid;
-
+  np->thread_id = 0;
   release(&np->lock);
 
   acquire(&wait_lock);
@@ -680,4 +712,111 @@ procdump(void)
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
   }
+}
+
+static struct proc*
+allocproc_thread()
+{
+  struct proc *p;
+  p = proc;
+  while (p < &proc[NPROC]) {
+      acquire(&p->lock);
+      if (p->state == UNUSED) {
+          break;  // Exit the loop if an UNUSED process is found
+      } else {
+          release(&p->lock);
+      }
+      p++;
+  }
+  if (p >= &proc[NPROC]) {
+    return 0;  // No UNUSED process found
+  }
+
+  p->pid = allocpid();
+  p->thread_id = alloc_thread_id();
+  p->state = USED;
+
+  // Allocate memory for the trapframe
+  if (!(p->trapframe = (struct trapframe *)kalloc())) {
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
+  // Copy the pagetable from the current process
+  p->pagetable = (myproc())->pagetable;
+
+  // Map the trapframe into the user space
+  int mapping_result = mappages(p->pagetable, TRAPFRAME - PGSIZE * p->thread_id, PGSIZE,
+                               (uint64)(p->trapframe), PTE_R | PTE_W);
+  if (mapping_result < 0) {
+      do {
+          uvmunmap(p->pagetable, TRAMPOLINE, 1, 0);
+          uvmfree(p->pagetable, 0);
+          release(&p->lock);
+          return 0;
+      } while (0);
+  }
+
+  // Initialize context for the new thread
+  memset(&p->context, 0, sizeof(p->context));
+  p->context.ra = (uint64)forkret;
+  p->context.sp = p->kstack + PGSIZE;
+
+  return p;
+}
+
+int
+clone(int addr)
+{
+    struct proc *np, *p;
+    // Get the current process
+    p = myproc();
+
+    // Attempt to allocate a new thread
+    if ((np = allocproc_thread()) == 0) {
+        return -1;
+    }
+
+    // Copy the trapframe from the current process
+    *(np->trapframe) = *(p->trapframe);
+
+    // Set the new thread's stack pointer and size
+    np->trapframe->sp = addr + PGSIZE;
+    np->sz = p->sz;
+
+    // Set return value in the new thread's trapframe
+    np->trapframe->a0 = 0;
+
+    // Duplicate open files
+    int i = 0;
+    while (i < NOFILE) {
+        if (p->ofile[i]) {
+            np->ofile[i] = filedup(p->ofile[i]);
+        }
+        i++;
+    }
+
+    // Duplicate current working directory
+    np->cwd = idup(p->cwd);
+
+    // Copy the process name
+    strncpy(np->name, p->name, sizeof(np->name) - 1);
+    np->name[sizeof(np->name) - 1] = '\0';
+
+    // Release the lock before associating the new thread with the parent
+    release(&np->lock);
+
+    // Acquire the wait lock, associate the new thread with the parent, and release the wait lock
+    acquire(&wait_lock);
+    np->parent = p;
+    release(&wait_lock);
+
+    // Reacquire the lock and set the new thread to a RUNNABLE state
+    acquire(&np->lock);
+    np->state = RUNNABLE;
+    release(&np->lock);
+
+    // Return the thread ID of the new thread
+    return np->thread_id;
 }

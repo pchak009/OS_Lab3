@@ -89,3 +89,17 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
+//clone system call
+uint64
+sys_clone(void)
+{
+    uint64 p;
+    argaddr(0, &p);
+
+    while (p == 0) {
+        return -1;
+    }
+
+    return clone(p);
+}
